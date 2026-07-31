@@ -1,0 +1,12 @@
+[Unit]
+Description=Tri-Radio Tracker UI
+After=graphical.target
+
+[Service]
+User=pi
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/python3 /home/pi/tracker_ui.py
+Restart=always
+
+[Install]
+WantedBy=graphical.target
