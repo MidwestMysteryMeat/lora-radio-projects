@@ -48,6 +48,24 @@ ble_lora_tracker/
   burst and shows a countdown. Inside BLE range it flips to live BLE
   RSSI for close-range homing.
 
+## Radio-path status
+
+- **BLE close-range path — working as written.** The tag packs its fix
+  into BLE manufacturer-data advertisements (`TAG1` marker + signed
+  big-endian lat/lon, degrees × 1e6) and the finder's `bleak` scanner
+  decodes them directly. This is the path to rely on.
+- **LoRa long-range path — not functional as written.** The tag
+  transmits raw SX1276 frames (its own 15-byte payload, no Meshtastic
+  framing), but the finder listens through the Meshtastic Python API
+  for *decoded position packets* from node id `'!TAG1'`. Meshtastic
+  never decodes the tag's raw frames into position packets, and
+  `'!TAG1'` is not a valid Meshtastic node id, so this listener can
+  never fire. Making long range work needs either a Meshtastic node on
+  the tag side actually sending position packets (with the finder
+  filtering on its real node id), or a raw SX1276/SX1262 receiver on
+  the finder that parses the tag's frame format. Until then, treat this
+  build as a close-range (BLE) locator.
+
 ## Setup
 
 Tag: flash MicroPython to the XIAO ESP32-S3, copy `tag_firmware/main.py`

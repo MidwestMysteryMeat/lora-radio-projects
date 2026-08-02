@@ -73,14 +73,27 @@ Antenna vertical and as high as possible.
 
 ## Flashing Meshtastic (all 3 devices, before any custom code)
 
+The T-Echo is an **nRF52840**, not an ESP32 — `esptool` does not apply to
+it. It ships with a UF2 bootloader and flashes by drag-and-drop:
+
 ```bash
-pip install meshtastic --break-system-packages
+# T-Echo handhelds (both): nRF52840, UF2 bootloader.
+# 1. Connect USB and double-press the reset button -- the board mounts
+#    as a USB mass-storage drive (TECHOBOOT).
+# 2. Download the T-Echo UF2 from Meshtastic's firmware releases
+#    (firmware-t-echo-<version>.uf2).
+# 3. Copy/drag the .uf2 onto the drive -- it flashes and reboots itself.
+#
+# Alternative (no drive appears / headless): serial DFU with the
+# matching DFU .zip package:
+#   pip install adafruit-nrfutil
+#   adafruit-nrfutil dfu serial --package firmware-t-echo-<version>.zip \
+#       -p /dev/ttyACM0 -b 115200
 
-# T-Echo handhelds (both): hold BOOT while plugging in USB, then:
-esptool.py --chip esp32s3 write_flash 0x0 meshtastic-firmware-t-echo.bin
-
-# Heltec roof node:
-esptool.py --chip esp32 write_flash 0x0 meshtastic-firmware-heltec-v3.bin
+# Heltec WiFi LoRa 32 V3 roof node (ESP32-S3) -- this one IS esptool:
+pip install meshtastic esptool --break-system-packages
+esptool.py --chip esp32s3 write_flash 0x0 meshtastic-firmware-heltec-v3.bin
+# (or use the Meshtastic Web Flasher, which picks the right offsets for you)
 ```
 
 Then configure each device in the Meshtastic phone app:

@@ -156,12 +156,27 @@ def read_gps(timeout_ms=8000):
 
 
 # ── Payload ──────────────────────────────────────────────────────────────
+# MicroPython's int.to_bytes()/int.from_bytes() take no 'signed' argument,
+# so negative values (western longitudes, southern latitudes) are handled
+# manually as two's complement. Both devices run this same file, so the
+# encoding and decoding stay in agreement.
+def i32_to_bytes(value):
+    """Encode a signed int as 4 bytes big-endian two's complement."""
+    return (value & 0xFFFFFFFF).to_bytes(4, 'big')
+
+
+def i32_from_bytes(raw):
+    """Decode 4 bytes big-endian two's complement as a signed int."""
+    value = int.from_bytes(raw, 'big')
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
 def make_payload(device_id, lat, lon):
     lat_int = int(lat * 1_000_000)
     lon_int = int(lon * 1_000_000)
     data = bytearray(device_id)                     # 4-byte device id
-    data += lat_int.to_bytes(4, 'big', True)
-    data += lon_int.to_bytes(4, 'big', True)
+    data += i32_to_bytes(lat_int)
+    data += i32_to_bytes(lon_int)
     return bytes(data)
 
 
@@ -170,8 +185,8 @@ def parse_payload(data):
     if data is None or len(data) < 12:
         return None
     device_id = data[0:4]
-    lat = int.from_bytes(data[4:8], 'big', True) / 1_000_000
-    lon = int.from_bytes(data[8:12], 'big', True) / 1_000_000
+    lat = i32_from_bytes(data[4:8]) / 1_000_000
+    lon = i32_from_bytes(data[8:12]) / 1_000_000
     return device_id, lat, lon
 
 

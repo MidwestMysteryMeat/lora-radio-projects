@@ -7,6 +7,14 @@ via background threads, and always uses the most recently received tag
 position regardless of which radio delivered it. Inside BLE range the
 display switches to live BLE data for precise close-range direction finding.
 
+NOTE -- radio-path status (see README "Radio-path status"): the BLE
+close-range path is the working one. The Meshtastic/LoRa listener below
+is NOT functional against the current tag firmware: the tag transmits
+raw SX1276 frames, which the Meshtastic stack never decodes into the
+position packets this thread subscribes to (and '!TAG1' is not a real
+Meshtastic node id). The thread is kept as scaffolding for a future
+Meshtastic-based tag.
+
 Reconstructed from conversation history.
 
 Deps:
@@ -90,15 +98,21 @@ def haversine_miles(lat1, lon1, lat2, lon2):
 # ── BLE scanner thread ───────────────────────────────────────────────────
 def parse_ble_payload(raw: bytes):
     """Extract (lat, lon) from a tag's manufacturer-data payload.
-    Mirrors make_ble_payload() in the tag firmware: the payload contains
-    the TAG1 marker followed by lat(4) + lon(4) big-endian fixed-point."""
+    Mirrors make_payload() in the tag firmware: the payload contains the
+    TAG1 marker followed by lat(4) + lon(4) big-endian SIGNED
+    (two's-complement) fixed-point, degrees * 1e6. Sign extension here
+    must match the tag's i32_to_bytes() -- US longitudes are negative."""
     try:
         if b'TAG1' not in raw:
             return None, None
         idx = raw.index(b'TAG1') + 4
-        lat = int.from_bytes(raw[idx:idx + 4], 'big') / 1_000_000
-        lon = int.from_bytes(raw[idx + 4:idx + 8], 'big') / 1_000_000
-        return lat, lon
+        lat_raw = int.from_bytes(raw[idx:idx + 4], 'big')
+        lon_raw = int.from_bytes(raw[idx + 4:idx + 8], 'big')
+        if lat_raw & 0x80000000:
+            lat_raw -= 0x100000000
+        if lon_raw & 0x80000000:
+            lon_raw -= 0x100000000
+        return lat_raw / 1_000_000, lon_raw / 1_000_000
     except Exception:
         return None, None
 

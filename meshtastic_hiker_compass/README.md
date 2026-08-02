@@ -40,6 +40,26 @@ no server.
 - The roof node (ROUTER role) relays packets so two hikers out of direct
   range of each other still stay connected through it
 
+## Known limitation — serial position parser
+
+`parse_position_line()` in `main.py` expects Meshtastic to emit **JSON
+lines** over the serial port. Stock Meshtastic firmware does not do that:
+its serial/USB port speaks the **framed protobuf client API** (the same
+binary protocol the phone app and Python CLI use), so `ujson.loads` on
+raw serial lines will never match and no positions will ever be parsed.
+To make this path real you need one of:
+
+- a companion bridge (e.g. a host or second MCU running the Meshtastic
+  Python API) that decodes packets and forwards them as JSON lines to
+  the handheld's UART, or
+- a protobuf-frame parser on the handheld itself (decode the 0x94 0xC3
+  framed `FromRadio` messages), or
+- a Meshtastic build/module configured to emit text/JSON output on a
+  spare serial port.
+
+As shipped, the compass display works but only ever shows "Waiting for
+GPS fix..." because no position updates arrive.
+
 ## Range reality
 
 - Open field: 3-6 miles; moderate forest: ~0.9-1.5 miles; dense wet

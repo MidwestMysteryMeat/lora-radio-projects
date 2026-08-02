@@ -3,7 +3,7 @@ main.py -- Tag firmware for the XIAO ESP32-S3 (MicroPython)
 
 Complete tag firmware. On every wake from deep sleep it:
   1. reads 6 bytes of state + a cached GPS fix from RTC memory (survives sleep)
-  2. checks the charge pin -- if charging, light-sleeps without advancing state
+  2. checks the charge pin -- if charging, deep-sleeps without advancing state
      (and detects USB-unplug as a "deploy" trigger that resets to Phase 0)
   3. advances the operating phase based on cumulative cycle count
   4. reads GPS every Nth cycle (caches the fix; uses the cache on skip cycles)
@@ -150,14 +150,30 @@ def read_gps(timeout_ms=8000):
     return None, None
 
 
+# ── Signed 32-bit coordinate encoding ────────────────────────────────────
+# MicroPython's int.to_bytes()/int.from_bytes() take no 'signed' argument,
+# so negative values (western longitudes, southern latitudes) are handled
+# manually as two's complement. The finder's parse_ble_payload() and the
+# RTC cache below must all agree on this encoding.
+def i32_to_bytes(value):
+    """Encode a signed int as 4 bytes big-endian two's complement."""
+    return (value & 0xFFFFFFFF).to_bytes(4, 'big')
+
+
+def i32_from_bytes(raw):
+    """Decode 4 bytes big-endian two's complement as a signed int."""
+    value = int.from_bytes(raw, 'big')
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
 # ── Payload + bursts ─────────────────────────────────────────────────────
 def make_payload(lat, lon, burst_index):
     lat_int = int(lat * 1_000_000)
     lon_int = int(lon * 1_000_000)
     data = bytearray(b'\xFF\xFF')                   # private company ID
     data += DEVICE_ID                               # b'TAG1'
-    data += lat_int.to_bytes(4, 'big')
-    data += lon_int.to_bytes(4, 'big')
+    data += i32_to_bytes(lat_int)
+    data += i32_to_bytes(lon_int)
     data += bytes([burst_index])
     return bytes(data)
 
@@ -229,16 +245,16 @@ def save_gps_cache(lat, lon):
     mem = bytearray(machine.RTC().memory())
     if len(mem) < 14:
         mem = mem + bytes(14 - len(mem))
-    mem[6:10] = lat_int.to_bytes(4, 'big', True)
-    mem[10:14] = lon_int.to_bytes(4, 'big', True)
+    mem[6:10] = i32_to_bytes(lat_int)
+    mem[10:14] = i32_to_bytes(lon_int)
     machine.RTC().memory(bytes(mem))
 
 
 def load_gps_cache():
     try:
         m = machine.RTC().memory()
-        lat = int.from_bytes(m[6:10], 'big', True) / 1_000_000
-        lon = int.from_bytes(m[10:14], 'big', True) / 1_000_000
+        lat = i32_from_bytes(m[6:10]) / 1_000_000
+        lon = i32_from_bytes(m[10:14]) / 1_000_000
         if lat == 0 and lon == 0:
             return None, None
         return lat, lon
@@ -258,11 +274,13 @@ def run():
         phase = 0
         cycle_count = 0
 
-    # Charging mode: light sleep, do not advance phase or counters
+    # Charging mode: deep sleep, do not advance phase or counters.
+    # Must be deepsleep -- waking from lightsleep resumes here and a
+    # SystemExit would drop to the REPL and halt the tag; deep-sleep
+    # wake restarts main.py so the charge pin is re-checked in 30s.
     if is_charging:
         write_rtc(cycle_idx, gps_skip, phase, 1, cycle_count)
-        machine.lightsleep(30_000)   # re-check charge pin in 30s; main.py restarts
-        raise SystemExit
+        machine.deepsleep(30_000)
 
     # Advance phase if cumulative cycle thresholds crossed
     if phase == 0 and cycle_count >= PHASE_THRESHOLDS[0]:
