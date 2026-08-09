@@ -84,9 +84,10 @@ The TP4056's CHRG pin goes LOW while charging, HIGH when idle, wired to
 GPIO3 with an internal pull-up — the only extra wire needed, no extra
 components. The firmware uses it two ways:
 
-- **While charging:** the tag light-sleeps in a 30-second polling loop
-  (~1mA) and does NOT advance its phase or cycle counters — state is
-  frozen so shelf time doesn't burn through the phase schedule.
+- **While charging:** the tag deep-sleeps in 30-second cycles and does
+  NOT advance its phase or cycle counters — state is frozen so shelf
+  time doesn't burn through the phase schedule. (Deep sleep is required:
+  light-sleep would resume mid-function and can drop to the REPL.)
 - **On unplug (deploy trigger):** when USB is removed the CHRG pin
   transitions HIGH; the firmware detects that the previous wake was
   charging and this one isn't, and resets all counters to zero — a fresh

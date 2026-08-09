@@ -13,9 +13,8 @@ is NOT functional against the current tag firmware: the tag transmits
 raw SX1276 frames, which the Meshtastic stack never decodes into the
 position packets this thread subscribes to (and '!TAG1' is not a real
 Meshtastic node id). The thread is kept as scaffolding for a future
-Meshtastic-based tag.
-
-Reconstructed from conversation history.
+Meshtastic-based tag. parse_lora_payload() is provided for a raw SX1262
+receiver path if you add one later.
 
 Deps:
     pip3 install pygame gpsd-py3 bleak meshtastic
@@ -27,11 +26,12 @@ Hardware:
     - Official 7" DSI touchscreen (800x480)
 """
 
-import pygame
 import math
 import time
 import threading
 import asyncio
+
+import pygame
 
 from bleak import BleakScanner
 
@@ -50,7 +50,8 @@ except ImportError:
     HAS_MESHTASTIC = False
     print("[tracker_ui] meshtastic library not available -- LoRa receive disabled.")
 
-# ── Shared state (updated by background threads) ─────────────────────────
+# ── Shared state (updated by background threads under _state_lock) ───────
+_state_lock = threading.Lock()
 state = {
     'tag_lat':    None,
     'tag_lon':    None,
@@ -59,23 +60,38 @@ state = {
     'lora_age':   999,         # seconds since last LoRa packet
     'my_lat':     None,
     'my_lon':     None,
-    'last_burst': 0,           # epoch of last received burst
-    'next_burst': 0,           # predicted next burst epoch
+    'last_burst': 0.0,         # epoch of last received burst
+    'next_burst': 0.0,         # predicted next burst epoch
     'burst_cycle': 0,          # 0 = expecting 1min, 1 = expecting 3min
 }
 BURST_PATTERN = [60, 180]      # must match the tag firmware phase-1 sleep
 DEVICE_ID = b'TAG1'
 BLE_RANGE_TIMEOUT_S = 8        # if no BLE packet in this long, drop out of BLE mode
+LORA_STALE_S = 300             # after this, LoRa is considered stale
 
 
-def note_burst_received():
-    """Record burst timing and predict the next one (tag alternates
-    1min sleep -> burst -> 3min sleep -> burst -> repeat)."""
+def _snapshot_state():
+    """Copy state under the lock for the render thread."""
+    with _state_lock:
+        return dict(state)
+
+
+def note_burst_received(source='BLE'):
+    """Record burst timing and predict the next one.
+
+    Tag phase-1 alternates 1 min sleep -> burst -> 3 min sleep -> burst.
+    Prediction is approximate if the tag is still in phase 0 or 2.
+    """
     now = time.time()
-    state['last_burst'] = now
-    cycle = state['burst_cycle']
-    state['next_burst'] = now + BURST_PATTERN[cycle]
-    state['burst_cycle'] = (cycle + 1) % 2
+    with _state_lock:
+        state['last_burst'] = now
+        cycle = state['burst_cycle']
+        state['next_burst'] = now + BURST_PATTERN[cycle]
+        state['burst_cycle'] = (cycle + 1) % 2
+        if source == 'BLE':
+            state['radio_mode'] = 'BLE'
+        elif state['radio_mode'] != 'BLE':
+            state['radio_mode'] = 'LORA'
 
 
 # ── Compass math ─────────────────────────────────────────────────────────
@@ -83,7 +99,8 @@ def bearing_to(lat1, lon1, lat2, lon2):
     dlon = math.radians(lon2 - lon1)
     lat1r, lat2r = math.radians(lat1), math.radians(lat2)
     x = math.sin(dlon) * math.cos(lat2r)
-    y = math.cos(lat1r) * math.sin(lat2r) - math.sin(lat1r) * math.cos(lat2r) * math.cos(dlon)
+    y = (math.cos(lat1r) * math.sin(lat2r) -
+         math.sin(lat1r) * math.cos(lat2r) * math.cos(dlon))
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
 
@@ -91,45 +108,73 @@ def haversine_miles(lat1, lon1, lat2, lon2):
     R = 3958.8  # Earth radius in miles
     d1 = math.radians(lat2 - lat1)
     d2 = math.radians(lon2 - lon1)
-    a = math.sin(d1 / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d2 / 2) ** 2
+    a = (math.sin(d1 / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(d2 / 2) ** 2)
+    a = min(1.0, max(0.0, a))
     return 2 * R * math.asin(math.sqrt(a))
 
 
-# ── BLE scanner thread ───────────────────────────────────────────────────
+def i32_from_bytes(raw):
+    """Decode 4 bytes big-endian two's complement as a signed int."""
+    value = int.from_bytes(raw[:4], 'big')
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
+# ── Payload parsers ──────────────────────────────────────────────────────
 def parse_ble_payload(raw: bytes):
     """Extract (lat, lon) from a tag's manufacturer-data payload.
+
     Mirrors make_payload() in the tag firmware: the payload contains the
     TAG1 marker followed by lat(4) + lon(4) big-endian SIGNED
     (two's-complement) fixed-point, degrees * 1e6. Sign extension here
-    must match the tag's i32_to_bytes() -- US longitudes are negative."""
+    must match the tag's i32_to_bytes() -- US longitudes are negative.
+
+    `raw` may be either the full manufacturer body (including 0xFFFF
+    company id prefix) or the post-company-id remainder from bleak.
+    """
     try:
-        if b'TAG1' not in raw:
+        if not raw or b'TAG1' not in raw:
             return None, None
         idx = raw.index(b'TAG1') + 4
-        lat_raw = int.from_bytes(raw[idx:idx + 4], 'big')
-        lon_raw = int.from_bytes(raw[idx + 4:idx + 8], 'big')
-        if lat_raw & 0x80000000:
-            lat_raw -= 0x100000000
-        if lon_raw & 0x80000000:
-            lon_raw -= 0x100000000
-        return lat_raw / 1_000_000, lon_raw / 1_000_000
-    except Exception:
+        if len(raw) < idx + 8:
+            return None, None
+        lat = i32_from_bytes(raw[idx:idx + 4]) / 1_000_000
+        lon = i32_from_bytes(raw[idx + 4:idx + 8]) / 1_000_000
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            return None, None
+        return lat, lon
+    except (ValueError, IndexError, TypeError):
         return None, None
 
 
+def parse_lora_payload(raw: bytes):
+    """Decode a raw SX1276 frame from the tag (same layout as BLE body).
+
+    Use this if you add a raw LoRa receiver on the finder. The Meshtastic
+    path cannot decode these frames.
+    """
+    return parse_ble_payload(raw)
+
+
+# ── BLE scanner thread ───────────────────────────────────────────────────
 async def ble_scan_loop():
     def on_detect(device, adv):
-        raw = adv.manufacturer_data
+        raw = getattr(adv, 'manufacturer_data', None) or {}
         if not raw:
             return
-        for company_id, payload in raw.items():
-            lat, lon = parse_ble_payload(payload)
-            if lat is not None:
+        for _company_id, payload in raw.items():
+            # bleak may hand back bytes or bytearray
+            lat, lon = parse_ble_payload(bytes(payload))
+            if lat is None:
+                continue
+            rssi = getattr(adv, 'rssi', None)
+            with _state_lock:
                 state['tag_lat'] = lat
                 state['tag_lon'] = lon
-                state['tag_rssi'] = adv.rssi
-                state['radio_mode'] = 'BLE'
-                note_burst_received()
+                state['tag_rssi'] = rssi
+            note_burst_received(source='BLE')
+            break
 
     scanner = BleakScanner(detection_callback=on_detect)
     await scanner.start()
@@ -137,40 +182,79 @@ async def ble_scan_loop():
         while True:
             await asyncio.sleep(1)
             # Drop out of BLE mode if we haven't heard a BLE packet recently
-            if state['tag_rssi'] is not None and (time.time() - state['last_burst']) > BLE_RANGE_TIMEOUT_S:
-                state['tag_rssi'] = None
-                if state['radio_mode'] == 'BLE':
-                    state['radio_mode'] = 'LORA' if state['lora_age'] < 300 else 'SEARCHING'
+            with _state_lock:
+                last = state['last_burst']
+                rssi = state['tag_rssi']
+                mode = state['radio_mode']
+                lora_age = state['lora_age']
+            if rssi is not None and (time.time() - last) > BLE_RANGE_TIMEOUT_S:
+                with _state_lock:
+                    state['tag_rssi'] = None
+                    if state['radio_mode'] == 'BLE':
+                        state['radio_mode'] = (
+                            'LORA' if state['lora_age'] < LORA_STALE_S
+                            else 'SEARCHING'
+                        )
     finally:
         await scanner.stop()
 
 
-# ── Meshtastic / LoRa thread ─────────────────────────────────────────────
+# ── Meshtastic / LoRa thread (scaffolding — see radio-path status) ───────
 def start_meshtastic():
     if not HAS_MESHTASTIC:
         return
-    from pubsub import pub
+    try:
+        from pubsub import pub
+    except ImportError:
+        print("[tracker_ui] pubsub not available -- LoRa receive disabled.")
+        return
 
-    def on_receive(packet, interface):
+    def on_receive(packet, interface):  # noqa: ARG001
         try:
-            pos = packet['decoded']['position']
-            if packet.get('fromId', '') == '!TAG1' or 'TAG1' in str(packet):
-                state['tag_lat'] = pos['latitude']
-                state['tag_lon'] = pos['longitude']
+            decoded = packet.get('decoded') or {}
+            pos = decoded.get('position')
+            if not isinstance(pos, dict):
+                return
+            from_id = str(packet.get('fromId', '') or '')
+            # Real Meshtastic node ids look like '!aabbccdd'. '!TAG1' will
+            # never match a live node — keep the check for a future tag
+            # that actually publishes position through Meshtastic.
+            if from_id != '!TAG1' and 'TAG1' not in str(packet):
+                # Still accept if caller configured a real node filter later
+                return
+            lat = pos.get('latitude')
+            lon = pos.get('longitude')
+            if lat is None or lon is None:
+                # Some builds use scaled integers
+                lat_i = pos.get('latitudeI')
+                lon_i = pos.get('longitudeI')
+                if lat_i is None or lon_i is None:
+                    return
+                lat = lat_i / 1e7
+                lon = lon_i / 1e7
+            lat = float(lat)
+            lon = float(lon)
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                return
+            with _state_lock:
+                state['tag_lat'] = lat
+                state['tag_lon'] = lon
                 state['lora_age'] = 0
-                state['last_burst'] = time.time()
-                if state['radio_mode'] != 'BLE':
-                    state['radio_mode'] = 'LORA'
-                note_burst_received()
+            note_burst_received(source='LORA')
         except Exception:
             pass
 
     try:
-        meshtastic.serial_interface.SerialInterface('/dev/ttyS0')
+        # Keep a reference so the interface is not GC'd
+        iface = meshtastic.serial_interface.SerialInterface('/dev/ttyS0')
         pub.subscribe(on_receive, 'meshtastic.receive.position')
         while True:
             time.sleep(1)
-            state['lora_age'] += 1
+            with _state_lock:
+                if state['lora_age'] < 10_000:
+                    state['lora_age'] += 1
+        # silence unused warning in some linters
+        _ = iface
     except Exception as e:
         print(f"[tracker_ui] Meshtastic thread error: {e}")
 
@@ -181,7 +265,11 @@ def draw_display(screen, bearing, distance_mi, mode, rssi, next_burst_secs):
     screen.fill((15, 23, 42))   # dark navy
 
     # Radio mode badge
-    badge_colors = {'BLE': (37, 99, 235), 'LORA': (13, 148, 136), 'SEARCHING': (107, 114, 128)}
+    badge_colors = {
+        'BLE': (37, 99, 235),
+        'LORA': (13, 148, 136),
+        'SEARCHING': (107, 114, 128),
+    }
     color = badge_colors.get(mode, (107, 114, 128))
     pygame.draw.rect(screen, color, (20, 20, 160, 44), border_radius=8)
     font_sm = pygame.font.SysFont('Arial', 22, bold=True)
@@ -204,8 +292,10 @@ def draw_display(screen, bearing, distance_mi, mode, rssi, next_burst_secs):
     # Bearing arrow
     if bearing is not None:
         rad = math.radians(bearing - 90)
-        tip = (cx + int((r - 18) * math.cos(rad)), cy + int((r - 18) * math.sin(rad)))
-        tail = (cx - int(55 * math.cos(rad)), cy - int(55 * math.sin(rad)))
+        tip = (cx + int((r - 18) * math.cos(rad)),
+               cy + int((r - 18) * math.sin(rad)))
+        tail = (cx - int(55 * math.cos(rad)),
+                cy - int(55 * math.sin(rad)))
         pygame.draw.line(screen, (59, 130, 246), tail, tip, 7)
         pygame.draw.circle(screen, (59, 130, 246), tip, 11)
         pygame.draw.circle(screen, (15, 23, 42), tip, 5)
@@ -232,7 +322,9 @@ def draw_display(screen, bearing, distance_mi, mode, rssi, next_burst_secs):
     # Next-burst countdown
     font_cd2 = pygame.font.SysFont('Arial', 20)
     if next_burst_secs > 0:
-        s = font_cd2.render(f'Next burst in {int(next_burst_secs)}s', True, (148, 163, 184))
+        s = font_cd2.render(
+            f'Next burst in {int(next_burst_secs)}s', True, (148, 163, 184)
+        )
         screen.blit(s, (20, H - 40))
 
     pygame.display.flip()
@@ -242,40 +334,64 @@ def draw_display(screen, bearing, distance_mi, mode, rssi, next_burst_secs):
 def main():
     pygame.init()
     screen = pygame.display.set_mode((800, 480))
-    pygame.display.set_caption("Tri-Radio Tracker")
+    pygame.display.set_caption('Tri-Radio Tracker')
 
     if HAS_GPSD:
         try:
             gps_connect()
         except Exception as e:
-            print(f"[tracker_ui] gpsd connect failed: {e}")
+            print(f'[tracker_ui] gpsd connect failed: {e}')
 
-    threading.Thread(target=start_meshtastic, daemon=True).start()
-    threading.Thread(target=lambda: asyncio.run(ble_scan_loop()), daemon=True).start()
+    threading.Thread(target=start_meshtastic, daemon=True, name='meshtastic').start()
+    threading.Thread(
+        target=lambda: asyncio.run(ble_scan_loop()),
+        daemon=True,
+        name='ble-scan',
+    ).start()
 
     clock = pygame.time.Clock()
     while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                pygame.quit()
                 return
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                pygame.quit()
                 return
 
         if HAS_GPSD:
             try:
                 fix = get_current()
-                state['my_lat'] = fix.lat
-                state['my_lon'] = fix.lon
+                # Prefer mode >= 2 (2D/3D fix) when the attribute exists
+                mode = getattr(fix, 'mode', 3)
+                lat = getattr(fix, 'lat', None)
+                lon = getattr(fix, 'lon', None)
+                if mode >= 2 and lat is not None and lon is not None:
+                    with _state_lock:
+                        state['my_lat'] = float(lat)
+                        state['my_lon'] = float(lon)
             except Exception:
                 pass
 
+        snap = _snapshot_state()
         bearing = distance = None
-        if all([state['my_lat'], state['my_lon'], state['tag_lat'], state['tag_lon']]):
-            bearing = bearing_to(state['my_lat'], state['my_lon'], state['tag_lat'], state['tag_lon'])
-            distance = haversine_miles(state['my_lat'], state['my_lon'], state['tag_lat'], state['tag_lon'])
+        # `is not None` so equator / prime meridian (0.0) stay valid
+        if (snap['my_lat'] is not None and snap['my_lon'] is not None and
+                snap['tag_lat'] is not None and snap['tag_lon'] is not None):
+            bearing = bearing_to(
+                snap['my_lat'], snap['my_lon'],
+                snap['tag_lat'], snap['tag_lon'],
+            )
+            distance = haversine_miles(
+                snap['my_lat'], snap['my_lon'],
+                snap['tag_lat'], snap['tag_lon'],
+            )
 
-        next_burst_secs = max(0, state['next_burst'] - time.time())
-        draw_display(screen, bearing, distance, state['radio_mode'], state['tag_rssi'], next_burst_secs)
+        next_burst_secs = max(0.0, snap['next_burst'] - time.time())
+        draw_display(
+            screen, bearing, distance,
+            snap['radio_mode'], snap['tag_rssi'], next_burst_secs,
+        )
         clock.tick(10)   # 10fps is plenty for a compass
 
 

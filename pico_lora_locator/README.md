@@ -46,13 +46,21 @@ distance + direction arrow on a small OLED. No server, no WiFi, no phone.
 
 ```
 loop:
-  read my GPS
+  read my GPS (GPRMC/GNRMC)
+  random TX jitter (reduces two-unit collisions)
   broadcast (my id, lat, lon) over LoRa
-  listen ~2s for the other device's packet
+  listen ~2.5s for the other device's packet
   if heard: compute bearing + haversine distance
   draw arrow + distance on OLED
   sleep
 ```
+
+## Notes
+
+- OLED drawing uses `FrameBuffer.ellipse` (standard MicroPython) — needs
+  MicroPython ≥ 1.20 on the Pico.
+- Copy `ssd1306.py` from micropython-lib to the device root before running.
+- Set `MY_ID` / `OTHER_ID` opposite on the two units.
 
 This was the starting point of a larger family of builds — it later grew
 into a Meshtastic hiking-party compass (`../meshtastic_hiker_compass/`)

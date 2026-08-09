@@ -63,8 +63,14 @@ ble_lora_tracker/
   never fire. Making long range work needs either a Meshtastic node on
   the tag side actually sending position packets (with the finder
   filtering on its real node id), or a raw SX1276/SX1262 receiver on
-  the finder that parses the tag's frame format. Until then, treat this
-  build as a close-range (BLE) locator.
+  the finder that parses the tag's frame format
+  (`parse_lora_payload()` in `finder/tracker_ui.py` matches the tag's
+  wire layout for that path). Until then, treat this build as a
+  close-range (BLE) locator.
+
+  Also: HARDWARE.md assigns the RFM95W to the ESP32-C3 (Meshtastic),
+  while `tag_firmware/main.py` drives that radio from the S3 over SPI.
+  Those two paths cannot share one radio — pick one owner per board.
 
 ## Setup
 
