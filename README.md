@@ -54,7 +54,9 @@ close before a working field build:
 
 The consolidated release gates and required hardware evidence are in
 [`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md). Passing the host test suite
-does not remove the prototype status.
+does not remove the prototype status. Cross-project capability gaps, priorities,
+and milestone acceptance criteria are tracked in
+[`docs/PARITY_ROADMAP.md`](docs/PARITY_ROADMAP.md).
 
 **`pico_lora_locator`**
 - Copy `ssd1306.py` (micropython-lib) to each device — not included.
