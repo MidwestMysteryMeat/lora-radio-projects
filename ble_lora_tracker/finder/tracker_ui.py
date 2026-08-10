@@ -57,7 +57,8 @@ state = {
     'tag_lon':    None,
     'tag_rssi':   None,        # None = not currently in BLE range
     'radio_mode': 'SEARCHING', # 'BLE' | 'LORA' | 'SEARCHING'
-    'lora_age':   999,         # seconds since last LoRa packet
+    'last_ble_seen':  0.0,     # epoch of most recent valid BLE frame
+    'last_lora_seen': 0.0,     # epoch of most recent valid LoRa position
     'my_lat':     None,
     'my_lon':     None,
     'last_burst': 0.0,         # epoch of last received burst
@@ -66,8 +67,11 @@ state = {
 }
 BURST_PATTERN = [60, 180]      # must match the tag firmware phase-1 sleep
 DEVICE_ID = b'TAG1'
+MAX_BURST_INDEX = 8
 BLE_RANGE_TIMEOUT_S = 8        # if no BLE packet in this long, drop out of BLE mode
 LORA_STALE_S = 300             # after this, LoRa is considered stale
+BURST_DEDUP_S = 8              # one SOS burst contains several advertisements
+PRIVATE_COMPANY_ID = 0xFFFF
 
 
 def _snapshot_state():
@@ -76,22 +80,49 @@ def _snapshot_state():
         return dict(state)
 
 
-def note_burst_received(source='BLE'):
+def _is_recent(timestamp, now, timeout):
+    """True when timestamp is nonzero and no older than timeout seconds."""
+    return bool(timestamp) and 0 <= (now - timestamp) <= timeout
+
+
+def radio_mode_for_timestamps(now, last_ble_seen, last_lora_seen):
+    """Choose the freshest usable radio, preferring short-range BLE."""
+    if _is_recent(last_ble_seen, now, BLE_RANGE_TIMEOUT_S):
+        return 'BLE'
+    if _is_recent(last_lora_seen, now, LORA_STALE_S):
+        return 'LORA'
+    return 'SEARCHING'
+
+
+def should_count_burst(last_burst, now):
+    """Deduplicate the multiple BLE/LoRa observations in one SOS burst."""
+    return not _is_recent(last_burst, now, BURST_DEDUP_S)
+
+
+def note_burst_received(source='BLE', received_at=None):
     """Record burst timing and predict the next one.
 
     Tag phase-1 alternates 1 min sleep -> burst -> 3 min sleep -> burst.
     Prediction is approximate if the tag is still in phase 0 or 2.
     """
-    now = time.time()
+    now = time.time() if received_at is None else received_at
     with _state_lock:
+        if source == 'BLE':
+            state['radio_mode'] = 'BLE'
+        elif not _is_recent(
+                state['last_ble_seen'], now, BLE_RANGE_TIMEOUT_S):
+            state['radio_mode'] = 'LORA'
+
+        # The tag advertises several packets per SOS burst and the finder can
+        # hear the same burst over both radios. Advance the alternating sleep
+        # prediction only once for the whole burst.
+        if not should_count_burst(state['last_burst'], now):
+            return False
         state['last_burst'] = now
         cycle = state['burst_cycle']
         state['next_burst'] = now + BURST_PATTERN[cycle]
         state['burst_cycle'] = (cycle + 1) % 2
-        if source == 'BLE':
-            state['radio_mode'] = 'BLE'
-        elif state['radio_mode'] != 'BLE':
-            state['radio_mode'] = 'LORA'
+        return True
 
 
 # ── Compass math ─────────────────────────────────────────────────────────
@@ -117,35 +148,48 @@ def haversine_miles(lat1, lon1, lat2, lon2):
 
 def i32_from_bytes(raw):
     """Decode 4 bytes big-endian two's complement as a signed int."""
+    if raw is None or len(raw) < 4:
+        raise ValueError('need 4 bytes')
     value = int.from_bytes(raw[:4], 'big')
     return value - 0x100000000 if value & 0x80000000 else value
 
 
 # ── Payload parsers ──────────────────────────────────────────────────────
-def parse_ble_payload(raw: bytes):
-    """Extract (lat, lon) from a tag's manufacturer-data payload.
+def parse_tag_payload(raw: bytes):
+    """Extract (lat, lon, burst_index) from one exact tag frame.
 
     Mirrors make_payload() in the tag firmware: the payload contains the
     TAG1 marker followed by lat(4) + lon(4) big-endian SIGNED
     (two's-complement) fixed-point, degrees * 1e6. Sign extension here
     must match the tag's i32_to_bytes() -- US longitudes are negative.
 
-    `raw` may be either the full manufacturer body (including 0xFFFF
-    company id prefix) or the post-company-id remainder from bleak.
+    ``raw`` may be either the full manufacturer body (including 0xFFFF
+    company id prefix) or the post-company-id remainder from bleak. Exact
+    lengths and marker positions prevent unrelated manufacturer data that
+    contains the bytes ``TAG1`` from being interpreted as a location.
     """
     try:
-        if not raw or b'TAG1' not in raw:
-            return None, None
-        idx = raw.index(b'TAG1') + 4
-        if len(raw) < idx + 8:
-            return None, None
-        lat = i32_from_bytes(raw[idx:idx + 4]) / 1_000_000
-        lon = i32_from_bytes(raw[idx + 4:idx + 8]) / 1_000_000
+        raw = bytes(raw)
+        if len(raw) == 15 and raw[:2] == b'\xFF\xFF':
+            raw = raw[2:]
+        if (len(raw) != 13 or raw[:4] != DEVICE_ID or
+                raw[12] > MAX_BURST_INDEX):
+            return None
+        lat = i32_from_bytes(raw[4:8]) / 1_000_000
+        lon = i32_from_bytes(raw[8:12]) / 1_000_000
         if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-            return None, None
-        return lat, lon
+            return None
+        return lat, lon, raw[12]
     except (ValueError, IndexError, TypeError):
+        return None
+
+
+def parse_ble_payload(raw: bytes):
+    """Extract the backward-compatible ``(lat, lon)`` pair from a tag frame."""
+    parsed = parse_tag_payload(raw)
+    if parsed is None:
         return None, None
+    return parsed[0], parsed[1]
 
 
 def parse_lora_payload(raw: bytes):
@@ -163,17 +207,23 @@ async def ble_scan_loop():
         raw = getattr(adv, 'manufacturer_data', None) or {}
         if not raw:
             return
-        for _company_id, payload in raw.items():
-            # bleak may hand back bytes or bytearray
-            lat, lon = parse_ble_payload(bytes(payload))
-            if lat is None:
+        for company_id, payload in raw.items():
+            if company_id != PRIVATE_COMPANY_ID:
                 continue
+            # bleak may hand back bytes or bytearray
+            parsed = parse_tag_payload(payload)
+            if parsed is None:
+                continue
+            lat, lon, _burst_index = parsed
             rssi = getattr(adv, 'rssi', None)
+            now = time.time()
             with _state_lock:
                 state['tag_lat'] = lat
                 state['tag_lon'] = lon
                 state['tag_rssi'] = rssi
-            note_burst_received(source='BLE')
+                state['last_ble_seen'] = now
+                state['radio_mode'] = 'BLE'
+            note_burst_received(source='BLE', received_at=now)
             break
 
     scanner = BleakScanner(detection_callback=on_detect)
@@ -181,20 +231,17 @@ async def ble_scan_loop():
     try:
         while True:
             await asyncio.sleep(1)
-            # Drop out of BLE mode if we haven't heard a BLE packet recently
+            # Recompute mode from independent source timestamps. In particular,
+            # a LoRa update must not keep stale BLE RSSI alive, and a lone LoRa
+            # fix must eventually age back to SEARCHING.
+            now = time.time()
             with _state_lock:
-                last = state['last_burst']
-                rssi = state['tag_rssi']
-                mode = state['radio_mode']
-                lora_age = state['lora_age']
-            if rssi is not None and (time.time() - last) > BLE_RANGE_TIMEOUT_S:
-                with _state_lock:
+                mode = radio_mode_for_timestamps(
+                    now, state['last_ble_seen'], state['last_lora_seen'],
+                )
+                state['radio_mode'] = mode
+                if mode != 'BLE':
                     state['tag_rssi'] = None
-                    if state['radio_mode'] == 'BLE':
-                        state['radio_mode'] = (
-                            'LORA' if state['lora_age'] < LORA_STALE_S
-                            else 'SEARCHING'
-                        )
     finally:
         await scanner.stop()
 
@@ -239,7 +286,7 @@ def start_meshtastic():
             with _state_lock:
                 state['tag_lat'] = lat
                 state['tag_lon'] = lon
-                state['lora_age'] = 0
+                state['last_lora_seen'] = time.time()
             note_burst_received(source='LORA')
         except Exception:
             pass
@@ -250,9 +297,6 @@ def start_meshtastic():
         pub.subscribe(on_receive, 'meshtastic.receive.position')
         while True:
             time.sleep(1)
-            with _state_lock:
-                if state['lora_age'] < 10_000:
-                    state['lora_age'] += 1
         # silence unused warning in some linters
         _ = iface
     except Exception as e:

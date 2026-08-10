@@ -15,8 +15,9 @@ within ~100ft.
 > that was a generic single-board sketch. This is rebuilt from the actual
 > original build found in conversation history — the full ESP32-S3
 > MicroPython tag firmware (charge handling, GPS caching, deploy-on-unplug,
-> the real 6-byte RTC state layout), and the Pi Finder compass UI using
-> Meshtastic's real `pub.subscribe('meshtastic.receive.position')` API.
+> versioned RTC state with a signed-coordinate GPS cache), and the Pi Finder
+> compass UI using Meshtastic's real
+> `pub.subscribe('meshtastic.receive.position')` API.
 > Code is reconstructed from inline snippets, so verify pin assignments
 > against your actual wiring before relying on it. The tag firmware's
 > phase-threshold cycle counts are from the original but worth tuning to

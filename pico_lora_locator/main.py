@@ -78,16 +78,20 @@ IRQ_RX_DONE     = 0x40
 def sx_write(reg, val):
     """Write one register (MSB of address set = write)."""
     cs(0)
-    spi.write(bytes([(reg & 0x7F) | 0x80, val & 0xFF]))
-    cs(1)
+    try:
+        spi.write(bytes([(reg & 0x7F) | 0x80, val & 0xFF]))
+    finally:
+        cs(1)
 
 
 def sx_read(reg):
     """Read one register via a full-duplex SPI transaction."""
     buf = bytearray([reg & 0x7F, 0x00])
     cs(0)
-    spi.write_readinto(buf, buf)
-    cs(1)
+    try:
+        spi.write_readinto(buf, buf)
+    finally:
+        cs(1)
     return buf[1]
 
 
@@ -128,7 +132,7 @@ def lora_send(payload):
     sx_write(REG_PAYLOAD_LEN, len(payload))
     sx_write(REG_OP_MODE, MODE_LORA_TX)
 
-    deadline = time.ticks_ms() + 3000
+    deadline = time.ticks_add(time.ticks_ms(), 3000)
     while time.ticks_diff(deadline, time.ticks_ms()) > 0:
         if sx_read(REG_IRQ_FLAGS) & IRQ_TX_DONE:
             break
@@ -149,7 +153,7 @@ def lora_receive(timeout_ms=2000):
     sx_write(REG_FIFO_ADDR, sx_read(REG_RX_BASE))
     sx_write(REG_OP_MODE, MODE_LORA_RXCON)
 
-    deadline = time.ticks_ms() + timeout_ms
+    deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
     try:
         while time.ticks_diff(deadline, time.ticks_ms()) > 0:
             flags = sx_read(REG_IRQ_FLAGS)
@@ -171,6 +175,24 @@ def lora_receive(timeout_ms=2000):
 
 
 # ── GPS ──────────────────────────────────────────────────────────────────
+def _nmea_checksum_ok(sentence):
+    """Return True when an NMEA sentence has a valid/absent checksum."""
+    if '*' not in sentence:
+        return True
+    body, supplied = sentence.rsplit('*', 1)
+    supplied = supplied.strip()
+    if not body.startswith('$') or len(supplied) != 2:
+        return False
+    try:
+        expected = int(supplied, 16)
+    except ValueError:
+        return False
+    actual = 0
+    for char in body[1:]:
+        actual ^= ord(char)
+    return actual == expected
+
+
 def parse_rmc_sentence(line):
     """Parse a GPRMC/GNRMC (any talker) NMEA sentence into (lat, lon).
 
@@ -183,24 +205,33 @@ def parse_rmc_sentence(line):
         else:
             text = str(line)
         text = text.strip()
-        # Drop checksum tail if present
-        if '*' in text:
-            text = text.split('*', 1)[0]
         # Find $xxRMC (GP/GN/GL/GA and other talkers all end in RMC)
         start = text.find('$')
         if start < 0:
             return None, None
         text = text[start:]
+        if not _nmea_checksum_ok(text):
+            return None, None
+        if '*' in text:
+            text = text.split('*', 1)[0]
         parts = text.split(',')
-        if len(parts) < 7 or 'RMC' not in parts[0]:
+        if (len(parts) < 7 or len(parts[0]) != 6 or
+                not parts[0].startswith('$') or parts[0][3:] != 'RMC'):
             return None, None
         if parts[2] != 'A':                     # A = valid fix
+            return None, None
+        if parts[4] not in ('N', 'S') or parts[6] not in ('E', 'W'):
             return None, None
         rlat = float(parts[3])
         rlon = float(parts[5])
         # NMEA: DDMM.MMMM / DDDMM.MMMM
-        lat = int(rlat // 100) + (rlat % 100) / 60.0
-        lon = int(rlon // 100) + (rlon % 100) / 60.0
+        lat_deg, lat_min = int(rlat // 100), rlat % 100
+        lon_deg, lon_min = int(rlon // 100), rlon % 100
+        if (rlat < 0 or rlon < 0 or lat_min >= 60 or lon_min >= 60 or
+                lat_deg > 90 or lon_deg > 180):
+            return None, None
+        lat = lat_deg + lat_min / 60.0
+        lon = lon_deg + lon_min / 60.0
         if parts[4] == 'S':
             lat = -lat
         if parts[6] == 'W':
@@ -221,7 +252,7 @@ def read_gps(timeout_ms=8000):
         except Exception:
             break
 
-    deadline = time.ticks_ms() + timeout_ms
+    deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
     while time.ticks_diff(deadline, time.ticks_ms()) > 0:
         if gps.any():
             line = gps.readline()
@@ -256,6 +287,8 @@ def make_payload(device_id, lat, lon):
     """Build a 12-byte location packet: id(4) + lat_i32 + lon_i32."""
     if not isinstance(device_id, (bytes, bytearray)) or len(device_id) != 4:
         raise ValueError('device_id must be 4 bytes')
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise ValueError('coordinates out of range')
     lat_int = int(round(lat * 1_000_000))
     lon_int = int(round(lon * 1_000_000))
     data = bytearray(device_id)
@@ -266,7 +299,7 @@ def make_payload(device_id, lat, lon):
 
 def parse_payload(data):
     """Returns (device_id, lat, lon) or None."""
-    if data is None or len(data) < 12:
+    if data is None or len(data) != 12:
         return None
     device_id = bytes(data[0:4])
     try:

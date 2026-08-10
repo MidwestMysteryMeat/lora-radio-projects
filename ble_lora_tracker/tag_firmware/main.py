@@ -54,6 +54,7 @@ ble = bluetooth.BLE()
 ble.active(True)
 
 DEVICE_ID = b'TAG1'
+MAX_BURST_INDEX = 8
 
 # ── Phase configuration ──────────────────────────────────────────────────
 # Phase 0 -- first ~8 hours   -- 3-packet mini-burst -- 10s/20s sleep
@@ -90,15 +91,19 @@ IRQ_TX_DONE     = 0x08
 
 def sx_write(reg, val):
     cs(0)
-    spi.write(bytes([(reg & 0x7F) | 0x80, val & 0xFF]))
-    cs(1)
+    try:
+        spi.write(bytes([(reg & 0x7F) | 0x80, val & 0xFF]))
+    finally:
+        cs(1)
 
 
 def sx_read(reg):
     buf = bytearray([reg & 0x7F, 0x00])
     cs(0)
-    spi.write_readinto(buf, buf)
-    cs(1)
+    try:
+        spi.write_readinto(buf, buf)
+    finally:
+        cs(1)
     return buf[1]
 
 
@@ -133,7 +138,7 @@ def lora_send(payload):
         sx_write(REG_FIFO, b)
     sx_write(REG_PAYLOAD_LEN, len(payload))
     sx_write(REG_OP_MODE, MODE_LORA_TX)
-    deadline = time.ticks_ms() + 3000
+    deadline = time.ticks_add(time.ticks_ms(), 3000)
     while time.ticks_diff(deadline, time.ticks_ms()) > 0:
         # Always require the TxDone IRQ bit. DIO0 alone is not enough —
         # an unwired/floating pin would exit TX early and cut the packet.
@@ -145,6 +150,24 @@ def lora_send(payload):
 
 
 # ── GPS ──────────────────────────────────────────────────────────────────
+def _nmea_checksum_ok(sentence):
+    """Return True when an NMEA sentence has a valid/absent checksum."""
+    if '*' not in sentence:
+        return True
+    body, supplied = sentence.rsplit('*', 1)
+    supplied = supplied.strip()
+    if not body.startswith('$') or len(supplied) != 2:
+        return False
+    try:
+        expected = int(supplied, 16)
+    except ValueError:
+        return False
+    actual = 0
+    for char in body[1:]:
+        actual ^= ord(char)
+    return actual == expected
+
+
 def parse_rmc_sentence(line):
     """Parse a GPRMC/GNRMC NMEA sentence into (lat, lon) or (None, None)."""
     try:
@@ -153,21 +176,31 @@ def parse_rmc_sentence(line):
         else:
             text = str(line)
         text = text.strip()
-        if '*' in text:
-            text = text.split('*', 1)[0]
         start = text.find('$')
         if start < 0:
             return None, None
         text = text[start:]
+        if not _nmea_checksum_ok(text):
+            return None, None
+        if '*' in text:
+            text = text.split('*', 1)[0]
         parts = text.split(',')
-        if len(parts) < 7 or 'RMC' not in parts[0]:
+        if (len(parts) < 7 or len(parts[0]) != 6 or
+                not parts[0].startswith('$') or parts[0][3:] != 'RMC'):
             return None, None
         if parts[2] != 'A':
             return None, None
+        if parts[4] not in ('N', 'S') or parts[6] not in ('E', 'W'):
+            return None, None
         rlat = float(parts[3])
         rlon = float(parts[5])
-        lat = int(rlat // 100) + (rlat % 100) / 60.0
-        lon = int(rlon // 100) + (rlon % 100) / 60.0
+        lat_deg, lat_min = int(rlat // 100), rlat % 100
+        lon_deg, lon_min = int(rlon // 100), rlon % 100
+        if (rlat < 0 or rlon < 0 or lat_min >= 60 or lon_min >= 60 or
+                lat_deg > 90 or lon_deg > 180):
+            return None, None
+        lat = lat_deg + lat_min / 60.0
+        lon = lon_deg + lon_min / 60.0
         if parts[4] == 'S':
             lat = -lat
         if parts[6] == 'W':
@@ -187,7 +220,7 @@ def read_gps(timeout_ms=8000):
         except Exception:
             break
 
-    deadline = time.ticks_ms() + timeout_ms
+    deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
     while time.ticks_diff(deadline, time.ticks_ms()) > 0:
         if gps.any():
             line = gps.readline()
@@ -226,13 +259,17 @@ def make_payload(lat, lon, burst_index):
     BLE AD structure is [len, 0xFF, 0xFF, 0xFF, 'T','A','G','1', ...].
     bleak exposes company_id=0xFFFF and the remaining bytes starting at TAG1.
     """
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise ValueError('coordinates out of range')
+    if not isinstance(burst_index, int) or not (0 <= burst_index <= MAX_BURST_INDEX):
+        raise ValueError('burst_index out of range')
     lat_int = int(round(lat * 1_000_000))
     lon_int = int(round(lon * 1_000_000))
     data = bytearray(b'\xFF\xFF')                   # private company ID
     data += DEVICE_ID                               # b'TAG1'
     data += i32_to_bytes(lat_int)
     data += i32_to_bytes(lon_int)
-    data += bytes([burst_index & 0xFF])
+    data += bytes([burst_index])
     return bytes(data)
 
 
@@ -274,24 +311,31 @@ def fire_burst(lat, lon, n_packets):
 # Byte 0: cycle_index  (0/1 -- which sleep interval in current phase)
 # Byte 1: gps_skip     (counts up, GPS read when == 0)
 # Byte 2: phase        (0/1/2)
-# Byte 3: charge_flag  (1 = was charging last wake)
+# Byte 3: flags        (bit 0 = was charging, bit 1 = GPS cache valid)
 # Bytes 4-5: cycle_count (16-bit big-endian -- total cycles ever)
 # Bytes 6-13: cached last-known GPS fix (lat 4 bytes, lon 4 bytes)
 # Byte 14: magic (0xA5) -- detects first boot / wiped RTC
 RTC_MAGIC = 0xA5
 RTC_LEN = 15
+RTC_FLAG_CHARGING = 0x01
+RTC_FLAG_GPS_VALID = 0x02
 
 
 def read_rtc():
     try:
         m = machine.RTC().memory()
-        if len(m) < 6 or (len(m) >= RTC_LEN and m[14] != RTC_MAGIC):
+        # Accept the original six-byte state for a one-time migration.
+        # Any other truncated layout is corrupt; the current layout must
+        # carry the magic byte.
+        if len(m) == 6:
+            pass
+        elif len(m) < RTC_LEN or m[14] != RTC_MAGIC:
             raise ValueError('uninitialized RTC')
         cycle_idx   = m[0] % 2
         phase       = min(m[2], 2)
         gps_period  = GPS_EVERY_N[phase]
         gps_skip    = m[1] % gps_period
-        charge_flag = m[3] & 1
+        charge_flag = m[3] & RTC_FLAG_CHARGING
         cycle_count = (m[4] << 8) | m[5]
         return cycle_idx, gps_skip, phase, charge_flag, cycle_count
     except (ValueError, IndexError, TypeError):
@@ -302,15 +346,17 @@ def write_rtc(cycle_idx, gps_skip, phase, charge_flag, cycle_count):
     cycle_count = min(int(cycle_count), 0xFFFF)
     phase = min(int(phase), 2)
     gps_period = GPS_EVERY_N[phase]
-    # Preserve the GPS cache (bytes 6-13) when rewriting state
+    # Preserve only a cache explicitly marked valid by this layout.
     old = bytearray(machine.RTC().memory())
     new = bytearray(RTC_LEN)
-    if len(old) >= 14:
+    cache_flag = 0
+    if len(old) >= RTC_LEN and old[14] == RTC_MAGIC:
         new[6:14] = old[6:14]
+        cache_flag = old[3] & RTC_FLAG_GPS_VALID
     new[0] = int(cycle_idx) % 2
     new[1] = int(gps_skip) % gps_period
     new[2] = phase
-    new[3] = int(charge_flag) & 1
+    new[3] = ((RTC_FLAG_CHARGING if charge_flag else 0) | cache_flag)
     new[4] = (cycle_count >> 8) & 0xFF
     new[5] = cycle_count & 0xFF
     new[14] = RTC_MAGIC
@@ -318,32 +364,38 @@ def write_rtc(cycle_idx, gps_skip, phase, charge_flag, cycle_count):
 
 
 def save_gps_cache(lat, lon):
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise ValueError('coordinates out of range')
     lat_int = int(round(lat * 1_000_000))
     lon_int = int(round(lon * 1_000_000))
     mem = bytearray(machine.RTC().memory())
-    if len(mem) < RTC_LEN:
-        mem = mem + bytes(RTC_LEN - len(mem))
-        mem[14] = RTC_MAGIC
+    if len(mem) < RTC_LEN or mem[14] != RTC_MAGIC:
+        # Preserve a valid legacy six-byte state while upgrading it.
+        legacy = mem[:6] if len(mem) == 6 else bytes(6)
+        mem = bytearray(RTC_LEN)
+        mem[:6] = legacy
+    else:
+        mem = mem[:RTC_LEN]
     mem[6:10] = i32_to_bytes(lat_int)
     mem[10:14] = i32_to_bytes(lon_int)
+    mem[3] = (mem[3] & RTC_FLAG_CHARGING) | RTC_FLAG_GPS_VALID
+    mem[14] = RTC_MAGIC
     machine.RTC().memory(bytes(mem))
 
 
 def load_gps_cache():
     """Return cached (lat, lon) or (None, None).
 
-    Uses a valid-bit approach via the magic byte + non-default check.
-    (0, 0) in the Gulf of Guinea is treated as "no cache" — acceptable
-    for this hiking/asset-tracker use case.
+    The explicit validity flag distinguishes an empty cache from the valid
+    coordinate (0, 0), and the layout magic rejects stale RTC bytes.
     """
     try:
         m = machine.RTC().memory()
-        if len(m) < 14:
+        if (len(m) < RTC_LEN or m[14] != RTC_MAGIC or
+                not (m[3] & RTC_FLAG_GPS_VALID)):
             return None, None
         lat = i32_from_bytes(m[6:10]) / 1_000_000
         lon = i32_from_bytes(m[10:14]) / 1_000_000
-        if lat == 0.0 and lon == 0.0:
-            return None, None
         if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             return None, None
         return lat, lon
@@ -370,6 +422,7 @@ def run():
     if is_charging:
         write_rtc(cycle_idx, gps_skip, phase, 1, cycle_count)
         machine.deepsleep(30_000)
+        return  # defensive for ports/test doubles where deepsleep returns
 
     # Advance phase if cumulative cycle thresholds crossed
     if phase == 0 and cycle_count >= PHASE_THRESHOLDS[0]:

@@ -29,6 +29,15 @@ POINTS = [
 ]
 
 
+def with_nmea_checksum(body):
+    """Append the checksum for an NMEA body beginning with ``$``."""
+    assert body.startswith('$') and '*' not in body
+    checksum = 0
+    for char in body[1:]:
+        checksum ^= ord(char)
+    return '{}*{:02X}'.format(body, checksum)
+
+
 def load_functions(relpath, names, extra_globals=None):
     """Extract the named top-level functions from a source file and exec
     them in a fresh namespace, without importing the file's dependencies."""
@@ -93,6 +102,28 @@ def test_ble_payload_bleak_stripped(tag, finder):
         check_close(got_lon, lon, 'stripped BLE lon')
 
 
+def test_ble_payload_rejects_ambiguous_frames(tag, finder):
+    full = tag['make_payload'](44.97, -93.26, 7)
+    stripped = full[2:]
+    parsed = finder['parse_tag_payload'](full)
+    assert parsed is not None and parsed[2] == 7
+
+    # The old marker search accepted TAG1 at any offset and ignored trailing
+    # data. Only the two layouts emitted/exposed by the tag are valid.
+    assert finder['parse_tag_payload'](b'junk' + stripped) is None
+    assert finder['parse_tag_payload'](stripped + b'\x00') is None
+    assert finder['parse_tag_payload'](b'\x34\x12' + stripped) is None
+    assert finder['parse_ble_payload'](b'unrelated-TAG1-payload') == (None, None)
+    assert finder['parse_tag_payload'](stripped[:-1] + b'\x09') is None
+
+    for bad_index in (-1, 9, 256):
+        try:
+            tag['make_payload'](44.97, -93.26, bad_index)
+            assert False, 'tag accepted burst index {}'.format(bad_index)
+        except ValueError:
+            pass
+
+
 def test_pico_payload_roundtrip(pico):
     """Pico make_payload -> pico parse_payload (both locator ends)."""
     for lat, lon in POINTS:
@@ -109,6 +140,26 @@ def test_pico_rejects_short_payload(pico):
     assert pico['parse_payload'](None) is None
     assert pico['parse_payload'](b'') is None
     assert pico['parse_payload'](b'DEV1xxxx') is None  # only 8 bytes
+    assert pico['parse_payload'](b'DEV1' + bytes(9)) is None  # trailing data
+
+
+def test_encoders_reject_invalid_coordinates(tag, pico):
+    invalid = [
+        (90.000001, 0), (-90.000001, 0),
+        (0, 180.000001), (0, -180.000001),
+        (float('nan'), 0),
+    ]
+    for lat, lon in invalid:
+        try:
+            tag['make_payload'](lat, lon, 0)
+            assert False, 'tag accepted invalid coordinates {!r}'.format((lat, lon))
+        except ValueError:
+            pass
+        try:
+            pico['make_payload'](b'DEV1', lat, lon)
+            assert False, 'pico accepted invalid coordinates {!r}'.format((lat, lon))
+        except ValueError:
+            pass
 
 
 def test_lora_payload_alias(tag, finder):
@@ -123,9 +174,9 @@ def test_lora_payload_alias(tag, finder):
 # ── NMEA RMC ─────────────────────────────────────────────────────────────
 def test_parse_rmc_minneapolis(pico):
     # 44°58.2' N, 93°15.6' W  -> ~44.97, -93.26
-    sentence = (
-        b'$GPRMC,123519,A,4458.2000,N,09315.6000,W,'
-        b'022.4,084.4,230394,003.1,W*6A\r\n'
+    sentence = with_nmea_checksum(
+        '$GPRMC,123519,A,4458.2000,N,09315.6000,W,'
+        '022.4,084.4,230394,003.1,W'
     )
     lat, lon = pico['parse_rmc_sentence'](sentence)
     assert lat is not None
@@ -149,11 +200,26 @@ def test_parse_rmc_gnrmc_and_void(pico):
 
 
 def test_parse_rmc_tag_matches_pico(tag, pico):
-    sentence = (
-        b'$GPRMC,000000,A,0000.0000,N,0000.0000,E,'
-        b'0,0,010124,,,A*00'
+    sentence = with_nmea_checksum(
+        '$GPRMC,000000,A,0000.0000,N,0000.0000,E,'
+        '0,0,010124,,,A'
     )
     assert tag['parse_rmc_sentence'](sentence) == pico['parse_rmc_sentence'](sentence)
+
+
+def test_parse_rmc_rejects_corruption_and_bad_fields(tag, pico):
+    body = '$GPRMC,123519,A,4458.2000,N,09315.6000,W,0,0,230394,,,A'
+    valid = with_nmea_checksum(body)
+    corrupt = valid.replace('4458.2000', '4458.3000')
+    bad_minutes = '$GPRMC,123519,A,4460.0000,N,09315.6000,W,0,0,230394,,,A'
+    bad_hemisphere = '$GPRMC,123519,A,4458.2000,X,09315.6000,W,0,0,230394,,,A'
+    bad_type = '$GPRMCPLUS,123519,A,4458.2000,N,09315.6000,W'
+    for parser in (tag['parse_rmc_sentence'], pico['parse_rmc_sentence']):
+        assert parser(valid)[0] is not None
+        assert parser(corrupt) == (None, None)
+        assert parser(bad_minutes) == (None, None)
+        assert parser(bad_hemisphere) == (None, None)
+        assert parser(bad_type) == (None, None)
 
 
 # ── Math ─────────────────────────────────────────────────────────────────
@@ -178,6 +244,66 @@ def test_zero_coords_are_valid_for_distance(finder):
     """Regression: `all([lat, lon, ...])` treated 0.0 as missing."""
     d = finder['haversine_miles'](0.0, 0.0, 0.0, 1.0)
     assert d > 60  # ~69 miles per degree longitude at equator
+
+
+def test_finder_radio_freshness_and_burst_dedup(finder):
+    mode = finder['radio_mode_for_timestamps']
+    assert mode(100.0, 99.0, 100.0) == 'BLE'
+    assert mode(100.0, 0.0, 99.0) == 'LORA'
+    assert mode(1000.0, 900.0, 600.0) == 'SEARCHING'
+
+    count = finder['should_count_burst']
+    assert count(0.0, 100.0)
+    assert not count(100.0, 107.0)  # another packet/radio in same SOS burst
+    assert count(100.0, 109.0)
+    assert count(100.0, 99.0)       # wall-clock correction must not lock it out
+
+
+class FakeRTC:
+    def __init__(self):
+        self.data = b''
+
+    def memory(self, value=None):
+        if value is not None:
+            self.data = bytes(value)
+        return self.data
+
+
+class FakeMachine:
+    def __init__(self):
+        self.rtc = FakeRTC()
+
+    def RTC(self):
+        return self.rtc
+
+
+def test_rtc_cache_validity_and_migration(tag_rtc, fake_machine):
+    assert tag_rtc['load_gps_cache']() == (None, None)
+
+    # A current state without a saved fix must not turn zeroed bytes into (0, 0).
+    tag_rtc['write_rtc'](0, 0, 0, 0, 0)
+    assert tag_rtc['load_gps_cache']() == (None, None)
+
+    # Once explicitly saved, (0, 0) is a valid coordinate and survives state writes.
+    tag_rtc['save_gps_cache'](0.0, 0.0)
+    assert tag_rtc['load_gps_cache']() == (0.0, 0.0)
+    tag_rtc['write_rtc'](1, 2, 1, 1, 42)
+    assert tag_rtc['load_gps_cache']() == (0.0, 0.0)
+    assert tag_rtc['read_rtc']() == (1, 2, 1, 1, 42)
+
+    # Corrupt/partial current layouts are reset instead of trusted.
+    fake_machine.rtc.data = bytes(10)
+    assert tag_rtc['read_rtc']() == (0, 0, 0, 0, 0)
+    assert tag_rtc['load_gps_cache']() == (None, None)
+
+    # Preserve compatibility with the original six-byte state until rewritten.
+    fake_machine.rtc.data = bytes([1, 2, 1, 1, 0x12, 0x34])
+    assert tag_rtc['read_rtc']() == (1, 2, 1, 1, 0x1234)
+    tag_rtc['save_gps_cache'](44.97, -93.26)
+    assert tag_rtc['read_rtc']() == (1, 2, 1, 1, 0x1234)
+    lat, lon = tag_rtc['load_gps_cache']()
+    check_close(lat, 44.97, 'RTC lat')
+    check_close(lon, -93.26, 'RTC lon')
 
 
 # ── Meshtastic JSON parser ───────────────────────────────────────────────
@@ -221,22 +347,31 @@ def main():
         'ble_lora_tracker/tag_firmware/main.py',
         [
             'i32_to_bytes', 'i32_from_bytes', 'make_payload',
-            'parse_rmc_sentence',
+            'parse_rmc_sentence', '_nmea_checksum_ok',
         ],
-        extra_globals={'DEVICE_ID': b'TAG1'},
+        extra_globals={'DEVICE_ID': b'TAG1', 'MAX_BURST_INDEX': 8},
     )
     finder = load_functions(
         'ble_lora_tracker/finder/tracker_ui.py',
         [
-            'parse_ble_payload', 'parse_lora_payload',
+            'parse_tag_payload', 'parse_ble_payload', 'parse_lora_payload',
             'haversine_miles', 'bearing_to', 'i32_from_bytes',
+            '_is_recent', 'radio_mode_for_timestamps', 'should_count_burst',
         ],
+        extra_globals={
+            'DEVICE_ID': b'TAG1',
+            'MAX_BURST_INDEX': 8,
+            'BLE_RANGE_TIMEOUT_S': 8,
+            'LORA_STALE_S': 300,
+            'BURST_DEDUP_S': 8,
+        },
     )
     pico = load_functions(
         'pico_lora_locator/main.py',
         [
             'i32_to_bytes', 'i32_from_bytes', 'make_payload', 'parse_payload',
-            'parse_rmc_sentence', 'haversine_miles', 'bearing_to',
+            'parse_rmc_sentence', '_nmea_checksum_ok',
+            'haversine_miles', 'bearing_to',
         ],
     )
     mesh = load_functions(
@@ -247,20 +382,42 @@ def main():
         ],
     )
 
+    fake_machine = FakeMachine()
+    tag_rtc = load_functions(
+        'ble_lora_tracker/tag_firmware/main.py',
+        [
+            'i32_to_bytes', 'i32_from_bytes', 'read_rtc', 'write_rtc',
+            'save_gps_cache', 'load_gps_cache',
+        ],
+        extra_globals={
+            'machine': fake_machine,
+            'GPS_EVERY_N': [3, 3, 3],
+            'RTC_MAGIC': 0xA5,
+            'RTC_LEN': 15,
+            'RTC_FLAG_CHARGING': 0x01,
+            'RTC_FLAG_GPS_VALID': 0x02,
+        },
+    )
+
     tests = [
         ('tag i32 round-trip', lambda: test_tag_helpers_roundtrip(tag)),
         ('BLE payload round-trip', lambda: test_ble_payload_roundtrip(tag, finder)),
         ('BLE bleak-stripped', lambda: test_ble_payload_bleak_stripped(tag, finder)),
+        ('BLE frame validation', lambda: test_ble_payload_rejects_ambiguous_frames(tag, finder)),
         ('pico payload round-trip', lambda: test_pico_payload_roundtrip(pico)),
         ('pico short payload', lambda: test_pico_rejects_short_payload(pico)),
+        ('encoder coordinate validation', lambda: test_encoders_reject_invalid_coordinates(tag, pico)),
         ('lora payload alias', lambda: test_lora_payload_alias(tag, finder)),
         ('RMC Minneapolis', lambda: test_parse_rmc_minneapolis(pico)),
         ('RMC GNRMC/void', lambda: test_parse_rmc_gnrmc_and_void(pico)),
         ('RMC tag==pico', lambda: test_parse_rmc_tag_matches_pico(tag, pico)),
+        ('RMC validation', lambda: test_parse_rmc_rejects_corruption_and_bad_fields(tag, pico)),
         ('haversine known', lambda: test_haversine_known_distance(pico)),
         ('bearing north', lambda: test_bearing_due_north(pico)),
         ('bearing east', lambda: test_bearing_due_east(pico)),
         ('zero coords distance', lambda: test_zero_coords_are_valid_for_distance(finder)),
+        ('finder freshness/dedup', lambda: test_finder_radio_freshness_and_burst_dedup(finder)),
+        ('RTC cache/migration', lambda: test_rtc_cache_validity_and_migration(tag_rtc, fake_machine)),
         ('meshtastic parse', lambda: test_meshtastic_parse_scaled_and_decimal(mesh)),
         ('meshtastic garbage', lambda: test_meshtastic_rejects_garbage(mesh)),
         ('node id normalize', lambda: test_node_id_normalize(mesh)),
