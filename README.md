@@ -52,6 +52,12 @@ Per-project bills of materials are in each project's `README.md` / `HARDWARE.md`
 All three run on paper but are **reconstructed prototypes**. Concrete gaps to
 close before a working field build:
 
+The consolidated release gates and required hardware evidence are in
+[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md). Passing the host test suite
+does not remove the prototype status. Cross-project capability gaps, priorities,
+and milestone acceptance criteria are tracked in
+[`docs/PARITY_ROADMAP.md`](docs/PARITY_ROADMAP.md).
+
 **`pico_lora_locator`**
 - Copy `ssd1306.py` (micropython-lib) to each device — not included.
 - The `lora_receive()` RX path (RxDone/CRC handling) is reconstructed — **bench-test it** with two units before trusting.
@@ -61,8 +67,11 @@ close before a working field build:
 
 **`meshtastic_hiker_compass`**
 - Flash **Meshtastic** to all 3 devices and set a shared channel + PSK (steps in its `HARDWARE.md`).
-- Copy drivers `ssd1306.py` and `qmc5883l.py` to each handheld.
-- `parse_position_line()` is a **simplified stub** — Meshtastic's serial output format varies by build (JSON vs protobuf-text). Verify against your output or use the Meshtastic Python API.
+- Choose a display architecture. The included MicroPython sketch cannot run on
+  the same T-Echo at the same time as Meshtastic; it needs a separate controller
+  and JSON bridge, or must be ported into a native Meshtastic module.
+- `parse_position_line()` consumes bridge-provided JSON. Stock Meshtastic uses
+  framed protobuf on serial and will not feed this parser directly.
 - **Magnetometer calibration** (hard/soft-iron) is required for an accurate heading needle — not yet implemented.
 - Set real `MY_NODE_ID` / `OTHER_NODE_ID` / `HOME_NODE_ID` (read from the Meshtastic app) and the roof node's coordinates (shipped as `0.0/0.0` placeholder).
 - Solar roof node: size panel/battery + weatherproof enclosure (see `HARDWARE.md`).
@@ -79,8 +88,20 @@ close before a working field build:
 Each project has its own setup steps and hardware notes:
 
 - [`pico_lora_locator/README.md`](pico_lora_locator/README.md) — flash MicroPython, copy drivers, set IDs.
-- [`meshtastic_hiker_compass/README.md`](meshtastic_hiker_compass/README.md) + [`HARDWARE.md`](meshtastic_hiker_compass/HARDWARE.md) — Meshtastic flashing, channel/PSK, drivers.
+- [`meshtastic_hiker_compass/README.md`](meshtastic_hiker_compass/README.md) + [`HARDWARE.md`](meshtastic_hiker_compass/HARDWARE.md) — architecture blocker, Meshtastic baseline, and channel/PSK configuration.
 - [`ble_lora_tracker/README.md`](ble_lora_tracker/README.md) + [`HARDWARE.md`](ble_lora_tracker/HARDWARE.md) — tag flashing, Finder deps (`pygame gpsd-py3 bleak meshtastic`), `gpsd` config, systemd unit.
+
+## Host checks
+
+Pure protocol, parser, state, and geometry logic can be checked without the
+MicroPython hardware dependencies:
+
+```bash
+python -B tests/test_coord_roundtrip.py
+python -B -m compileall -q pico_lora_locator meshtastic_hiker_compass ble_lora_tracker tests
+```
+
+GitHub Actions runs both checks for every pull request.
 
 ## Kept splittable
 

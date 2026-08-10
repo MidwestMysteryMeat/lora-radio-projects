@@ -1,12 +1,13 @@
 """
-main.py -- Handheld compass display (runs on the T-Echo, MicroPython)
+main.py -- Prototype handheld compass display (MicroPython)
 
-Runs alongside Meshtastic firmware on the T-Echo. Meshtastic handles all
-LoRa mesh networking, GPS position broadcasting, and routing; this sketch
-just reads position data Meshtastic exposes over its local serial
-interface, reads the on-board magnetometer for the device's own heading,
-computes bearing to the selected target, and draws a compass needle on
-the OLED.
+This cannot run alongside stock Meshtastic on the same T-Echo: flashing
+MicroPython replaces the Meshtastic firmware. The sketch is retained as
+the display-side prototype for an architecture with a separate
+MicroPython controller and a JSON serial bridge, or as logic to port into
+a native Meshtastic module. It reads bridged position data, reads the
+magnetometer for the device's own heading, computes bearing to the selected
+target, and draws a compass needle on the OLED.
 
 A physical toggle switch picks the target: the other handheld, or the
 home/roof node.
@@ -30,8 +31,8 @@ import ssd1306
 import qmc5883l
 
 # ── Hardware setup ───────────────────────────────────────────────────────
-# T-Echo (nRF52840): verify these GPIO numbers against your board revision
-# and how the external OLED/magnetometer are wired (see HARDWARE.md).
+# Reconstructed T-Echo pin concept. Do not use this on a Meshtastic-flashed
+# T-Echo; select pins for the separate display controller (see HARDWARE.md).
 i2c = I2C(0, sda=Pin(21), scl=Pin(22), freq=400000)
 oled = ssd1306.SSD1306_I2C(128, 64, i2c, addr=0x3C)      # OLED at 0x3C
 compass_chip = qmc5883l.QMC5883L(i2c)                     # magnetometer at 0x0D

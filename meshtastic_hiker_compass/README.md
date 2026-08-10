@@ -31,9 +31,12 @@ no server.
 
 ## How it works
 
-- Meshtastic firmware (flashed to all 3 devices) does the mesh networking,
-  GPS sharing, and routing automatically — you don't write that part
-- The custom sketch on each handheld reads the shared positions, works out
+- Meshtastic firmware on the three mesh nodes does the networking, GPS
+  sharing, and routing.
+- A **separate display controller plus JSON bridge is required** to run the
+  included MicroPython sketch. Flashing MicroPython onto a T-Echo replaces
+  Meshtastic; the two firmwares cannot run concurrently on that MCU.
+- The display sketch reads bridged positions, works out
   bearing to the selected target, subtracts the device's own compass
   heading so the needle points where to actually *walk*, and renders it on
   the OLED
@@ -57,8 +60,13 @@ To make this path real you need one of:
 - a Meshtastic build/module configured to emit text/JSON output on a
   spare serial port.
 
-As shipped, the compass display works but only ever shows "Waiting for
-GPS fix..." because no position updates arrive.
+If `main.py` is flashed to a separate compatible controller without the missing
+bridge, it only shows "Waiting for GPS fix..." because no position updates
+arrive.
+
+The setup is therefore an architecture prototype, not a flashable three-device
+build. See [`PRODUCTION_READINESS.md`](../PRODUCTION_READINESS.md) for the
+decision and acceptance gates.
 
 ## Range reality
 
